@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+env/
+.env/
+ENV/
+
+# 本地凭证与运行数据；仓库只提供配置模板。
+.env
+.env.*
+!.env.example
+memory.db
+memory.db-*
+.idea/
+.DS_Store
