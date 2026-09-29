@@ -13,7 +13,7 @@ class Planner:
         # 复用 Agent 传入的 LLM 实例；客户端共用，但消息列表单独组装。
         self.llm = llm
 
-    def create_plan(self, user_input: str) -> Plan:
+    def create_plan(self, user_input: str, skill_text: str | None = None) -> Plan:
         """根据本轮输入生成计划，不在此处执行任何计划步骤。
 
         返回 Plan 实例。API 请求失败、输出不是合法 JSON 或字段校验不通过时，
@@ -55,6 +55,12 @@ class Planner:
                 "content": user_input,
             },
         ]
+
+        if skill_text:
+            messages.insert(1, {
+                "role": "system",
+                "content": f"制定计划时请参考以下技能说明：\n\n{skill_text}",
+            })
 
         # 不传 tools，因此此请求只用于生成计划；当前也未传入工具清单和历史消息。
         response = self.llm.chat(messages=messages)

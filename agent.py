@@ -5,11 +5,15 @@
 """
 
 import json
+from pathlib import Path
+
+from openai.types.responses import response
 
 from llm import LLM
 from memory import MemoryManager
 from memory_store import MemoryStore
 from planner import Planner
+from skills import SkillManager
 from state import AgentState, ToolResult, Plan
 from tools import Tools
 
@@ -39,6 +43,9 @@ class Agent:
 
         # Planner 复用模型客户端，通过独立提示词拆分任务，不执行工具。
         self.planner = Planner(self.llm)
+
+        # 获取skills
+        self.skills = SkillManager(Path(__file__).resolve().parent / "skills")
 
         # 系统消息定义 Agent 的基础角色；每次请求模型时都会放在上下文最前面。
         self.system_message = {
@@ -94,11 +101,11 @@ class Agent:
         }
 
     def execute_agent_loop(
-        self,
-        messages: list[dict],
-        current_turn: list[dict],
-        tools_schema: list,
-        state: AgentState,
+            self,
+            messages: list[dict],
+            current_turn: list[dict],
+            tools_schema: list,
+            state: AgentState,
     ) -> str | None:
         """完成一个计划步骤所需的模型与工具循环。
 
@@ -166,11 +173,11 @@ class Agent:
         return None
 
     def execute_plan(
-        self,
-        state: AgentState,
-        messages: list[dict],
-        current_turn: list[dict],
-        tools_schema: list,
+            self,
+            state: AgentState,
+            messages: list[dict],
+            current_turn: list[dict],
+            tools_schema: list,
     ) -> str | None:
         """按计划列表的顺序执行步骤，并更新步骤状态。
 
@@ -249,11 +256,43 @@ class Agent:
 
         return final_answer
 
-    def run(self, text: str):
+    def choose_skills(self, text: str) -> str | None:
+        """根据用户输入，从已登记的技能中选择一个或者不选"""
+        catalog = {
+            name: info["description"]
+            for name, info in self.skills.index.items()
+        }
+        if not catalog:
+            return None
+        response = self.llm.chat([
+            {
+                "role": "system",
+                "content": (
+                    "根据用户任务和技能目录，选择最相关的一个技能。"
+                    "不需要技能时返回 null。"
+                    '只返回 JSON，格式为 {"name": "技能名或 null"}。'
+                    f"\n技能目录：{json.dumps(catalog, ensure_ascii=False)}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": text
+            }
+        ])
+
+        choice = json.loads(response.content)["name"]
+
+        # 模型只能提议名称，程序复制它确实存在
+        if choice is not None and choice not in self.skills.index:
+            raise ValueError(f"模型选择了未知技能{choice}")
+        return choice
+
+    def run(self, text: str, skill_name: str | None = None) -> str:
         """执行一次用户任务，并返回最终文本回答。
 
         Args:
             text: 用户本轮输入。
+            skill_name: 技能名称。
 
         Returns:
             模型最终回答；若循环超限，则返回失败提示。
@@ -262,8 +301,13 @@ class Agent:
         # State 只属于一次 run，不能复用上一轮的 messages、步骤数或工具结果。
         state = AgentState(user_input=text)
 
+        # 把skills技能信息传入agent
+        if skill_name is not None:
+            skill_name = self.choose_skills(text)
+        skill_text = self.skills.load(skill_name) if skill_name else None
+
         # Planner 当前只读取本轮输入；生成计划时还没有收到历史、记忆或工具 schema。
-        state.plan = self.planner.create_plan(user_input=text)
+        state.plan = self.planner.create_plan(user_input=text, skill_text=skill_text)
 
         # 规划成功后才挂到实例上；若上面的规划抛异常，此引用仍是上一轮状态。
         # run 正常返回后，调用方可通过 agent.state 查看本轮执行轨迹。
@@ -273,6 +317,13 @@ class Agent:
         # 赋值不会复制列表：messages 与 state.messages 指向同一对象。
         messages = state.messages
         messages.append(self.system_message)
+
+        # 传入skills
+        if skill_text:
+            messages.append({
+                "role": "system",
+                "content": f"本次任务请参考以下技能说明：\n\n{skill_text}",
+            })
 
         # 注入计划的初始快照；这条内部指令不写入 history。
         plan_message = self.get_plan_message(state.plan)
