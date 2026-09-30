@@ -7,8 +7,6 @@
 import json
 from pathlib import Path
 
-from openai.types.responses import response
-
 from llm import LLM
 from memory import MemoryManager
 from memory_store import MemoryStore
@@ -106,11 +104,13 @@ class Agent:
             current_turn: list[dict],
             tools_schema: list,
             state: AgentState,
+            on_event=None,
     ) -> str | None:
         """完成一个计划步骤所需的模型与工具循环。
 
         messages 和 current_turn 都会原地追加消息：前者供模型继续执行，后者供
         run 保存本轮历史。state 记录所有步骤累计的执行循环调用次数与工具轨迹。
+        on_event 接收状态快照，用于通知外部展示工具结果，不决定下一步执行什么。
 
         Returns:
             本步骤的文本结果；循环耗尽或模型 content 为 None 时返回 None。
@@ -170,6 +170,10 @@ class Agent:
                         result=str(result),
                     )
                 )
+
+                # 工具消息和结构化结果都已保存，再通知外部展示最新状态。
+                if on_event is not None:
+                    on_event("state", state.model_dump())
         return None
 
     def execute_plan(
@@ -178,6 +182,7 @@ class Agent:
             messages: list[dict],
             current_turn: list[dict],
             tools_schema: list,
+            on_event=None,
     ) -> str | None:
         """按计划列表的顺序执行步骤，并更新步骤状态。
 
@@ -186,6 +191,7 @@ class Agent:
             messages: 各步骤共用的上下文，后续步骤可以读取前面的工具与模型结果。
             current_turn: 本轮对话记录，不包含内部 system 指令。
             tools_schema: 执行模型可使用的工具说明。
+            on_event: 从 run 传来的回调，通知步骤进度并继续传给工具循环。
 
         Returns:
             最后一步结果。缺少计划、空计划或某一步返回 None 时也返回 None。
@@ -231,9 +237,13 @@ class Agent:
             # 不加入 current_turn，因为它不是用户与助手之间的真实对话。
             messages.append(step_message)
 
+            if on_event is not None:
+                on_event("state", state.model_dump())
+
             # 复用同一执行循环；本步骤追加的结果留在 messages 中供后续步骤读取。
             step_result = self.execute_agent_loop(
-                messages, current_turn, tools_schema, state
+                messages, current_turn, tools_schema, state,
+                on_event=on_event,
             )
 
             # None 通常表示循环耗尽，也可能是模型没有返回 content；暂用相同提示。
@@ -241,12 +251,18 @@ class Agent:
                 step.status = "failed"
                 step.result = "执行次数超过限制，步骤未完成。"
 
+                if on_event is not None:
+                    on_event("state", state.model_dump())
+
                 # current_plan_step_id 保留失败步骤的 id，
                 # 方便之后判断任务失败在哪里。
                 return None
             # 当前将“拿到文本”视为完成，尚未识别文本中的工具失败或无法完成信息。
             step.status = "completed"
             step.result = step_result
+
+            if on_event is not None:
+                on_event("state", state.model_dump())
 
             # 不断覆盖，循环结束后保留的就是最后一步结果
             final_answer = step.result
@@ -287,12 +303,13 @@ class Agent:
             raise ValueError(f"模型选择了未知技能{choice}")
         return choice
 
-    def run(self, text: str, skill_name: str | None = None) -> str:
+    def run(self, text: str, skill_name: str | None = None, on_event=None) -> str:
         """执行一次用户任务，并返回最终文本回答。
 
         Args:
             text: 用户本轮输入。
             skill_name: 技能名称。
+            on_event: 可选的回调函数，接收事件名称和状态字典。
 
         Returns:
             模型最终回答；若循环超限，则返回失败提示。
@@ -301,17 +318,24 @@ class Agent:
         # State 只属于一次 run，不能复用上一轮的 messages、步骤数或工具结果。
         state = AgentState(user_input=text)
 
+        # 立即保存本轮状态，规划失败时也能读取它。
+        self.state = state
+
+        # 先通知任务开始；技能选择和规划都需要等待模型，此时 plan 仍为 None。
+        if on_event is not None:
+            on_event("state", state.model_dump())
+
         # 把skills技能信息传入agent
-        if skill_name is not None:
+        if skill_name is None:
             skill_name = self.choose_skills(text)
         skill_text = self.skills.load(skill_name) if skill_name else None
 
         # Planner 当前只读取本轮输入；生成计划时还没有收到历史、记忆或工具 schema。
         state.plan = self.planner.create_plan(user_input=text, skill_text=skill_text)
 
-        # 规划成功后才挂到实例上；若上面的规划抛异常，此引用仍是上一轮状态。
-        # run 正常返回后，调用方可通过 agent.state 查看本轮执行轨迹。
-        self.state = state
+        # 计划已经写入 State，再通知外部，使接收方拿到包含计划的新快照。
+        if on_event is not None:
+            on_event("state", state.model_dump())
 
         # 本次 run 从空列表组装上下文，后续模型请求复用并追加该列表。
         # 赋值不会复制列表：messages 与 state.messages 指向同一对象。
@@ -349,12 +373,18 @@ class Agent:
         tools_schema = self.tools.get_tools_schema()
 
         # 外层执行计划，内层循环调用模型和工具。保存历史和记忆只在整体结束后做一次。
-        final_answer = self.execute_plan(state, messages, current_turn, tools_schema)
+        final_answer = self.execute_plan(
+            state, messages, current_turn, tools_schema,
+            on_event=on_event,
+        )
 
         if final_answer is None:
             # 缺失/空计划、执行超限或模型返回 None 都会进入这里，当前提示尚未细分。
             state.status = "failed"
             state.final_answer = "Agent 执行次数超过限制，任务未完成。"
+            # 步骤失败与整个任务失败是两个层级；此时通知任务的最终状态。
+            if on_event is not None:
+                on_event("state", state.model_dump())
             return state.final_answer
 
         # 以整轮为单位保存短期历史，后续不会从工具调用链中间截断消息。
@@ -369,4 +399,7 @@ class Agent:
         # State 必须在返回前更新，才能准确描述这次任务已经成功完成。
         state.status = "completed"
         state.final_answer = final_answer
+        # 最后一条快照包含任务结束状态和最终回答。
+        if on_event is not None:
+            on_event("state", state.model_dump())
         return final_answer
